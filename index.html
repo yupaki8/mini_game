@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Mini Runner</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1b1b2f;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      font-family: 'Courier New', monospace;
+    }
+    canvas { display: block; image-rendering: pixelated; }
+    #hint { margin-top: 10px; font-size: 13px; color: #a7a9be; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" width="800" height="280"></canvas>
+  <div id="hint">SPACE: ジャンプ</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx    = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  const W = canvas.width, H = canvas.height;
+  const GROUND = H - 50; // 230
+
+  // ============================================================
+  // Palette
+  // ============================================================
+  const C = {
+    bg:          '#1b1b2f',
+    ground:      '#c8c8d8',
+    groundD:     '#9898aa',
+    dirt:        '#7a5c1e',
+    dirtD:       '#5a3c0e',
+    pit:         '#070710',
+    // Player
+    player:      '#7fffd4',
+    playerD:     '#4db898',
+    eye:         '#1b1b2f',
+    blush:       '#ffaabb',
+    // Spike
+    spike:       '#ff6b81',
+    spikeD:      '#c0392b',
+    spikeTip:    '#ffffff',
+    // Slime
+    slime:       '#7bed9f',
+    slimeD:      '#3d8b55',
+    slimeEye:    '#1b1b2f',
+    // Boulder
+    boulder:     '#8899b0',
+    boulderD:    '#566070',
+    boulderH:    '#c8d4e8',
+    boulderC:    '#3a4050',
+    // Bat
+    bat:         '#a29bfe',
+    batD:        '#6c5ce7',
+    batEye:      '#ff3333',
+    // Jumper
+    jumper:      '#ff9f43',
+    jumperD:     '#e67e22',
+    jumperEye:   '#1b1b2f',
+    // Ghost (aerial)
+    ghost:       '#ffeaa7',
+    ghostD:      '#fdcb6e',
+    ghostEye:    '#636e72',
+    // Items
+    coin:        '#f1c40f',
+    coinShine:   '#ffffff',
+    coinD:       '#d4a017',
+    heart:       '#e84393',
+    heartShine:  '#ff9fd2',
+    // HUD
+    hud:         '#ffffff',
+    muted:       '#a7a9be',
+    dim:         'rgba(20,20,40,0.78)',
+    accent:      '#ff6b81',
+    orange:      '#ffd32a',
+    life:        '#ff6b81',
+    star:        'rgba(255,255,220,0.85)',
+  };
+
+  // ============================================================
+  // Audio
+  // ============================================================
+  let audioCtx = null;
+  function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  function tone(freq, dur, type = 'square', vol = 0.12) {
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.connect(g); g.connect(audioCtx.destination);
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  }
+  function sfxJump()    { tone(440, 0.07); setTimeout(() => tone(560, 0.06), 50); }
+  function sfxHit()     { tone(140, 0.28, 'sawtooth', 0.2); }
+  function sfxFall()    { [220, 180, 130].forEach((f, i) => setTimeout(() => tone(f, 0.12, 'sawtooth', 0.15), i * 55)); }
+  function sfxCoin()    { tone(880, 0.05, 'sine', 0.1); setTimeout(() => tone(1100, 0.05, 'sine', 0.08), 55); }
+  function sfxHeart()   { [660, 880, 1100].forEach((f, i) => setTimeout(() => tone(f, 0.08, 'sine', 0.1), i * 55)); }
+  function sfxStageUp() { [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => tone(f, 0.1, 'sine', 0.12), i * 80)); }
+
+  let bgmTimer = null;
+  const BGM = [262, 262, 330, 262, 349, 330, 262, 294, 330, 392, 330, 262];
+  let bgmIdx = 0;
+  function startBGM() {
+    if (bgmTimer) return;
+    bgmTimer = setInterval(() => { tone(BGM[bgmIdx++ % BGM.length], 0.22, 'sine', 0.055); }, 270);
+  }
+  function stopBGM() { clearInterval(bgmTimer); bgmTimer = null; }
+
+  // ============================================================
+  // Stars
+  // ============================================================
+  const stars = Array.from({ length: 60 }, () => ({
+    x: Math.random() * W, y: Math.random() * (GROUND - 20),
+    spd: Math.random() * 0.5 + 0.1,
+  }));
+
+  // ============================================================
+  // Player  (24×28, rotating jump)
+  // ============================================================
+  const PW = 24, PH = 28;
+
+  // Ghost/aerial: hit at apex but safe when running
+  // GROUND=230, PH=28: running top=202, apex top≈62
+  // Ghost: y=68, h=52, bottom=120 < 202 ✓; overlaps 62-90 ✓
+  const GHOST_TOP = 68, GHOST_H = 52;
+
+  const pl = {
+    x: 80, y: GROUND - PH,
+    vy: 0, onGround: true,
+    legPhase: 0, invincible: 0, rotation: 0,
+  };
+  function resetPlayer() {
+    pl.y = GROUND - PH; pl.vy = 0;
+    pl.onGround = true; pl.legPhase = 0;
+    pl.invincible = 0; pl.rotation = 0;
+  }
+  function doJump() {
+    if (!pl.onGround) return;
+    pl.vy = -14.5; pl.onGround = false; sfxJump();
+  }
+
+  // ============================================================
+  // Stages  (7 stages, rising difficulty)
+  // ============================================================
+  const STAGES = [
+    { at:    0, speed:  4.5 },
+    { at:  400, speed:  5.8 },
+    { at:  900, speed:  7.2 },
+    { at: 1800, speed:  8.8 },
+    { at: 3000, speed: 10.4 },
+    { at: 4500, speed: 12.0 },
+    { at: 6500, speed: 13.8 },
+  ];
+  let stageIdx = 0, stageFlash = 0;
+  function currentSpeed() { return STAGES[stageIdx].speed; }
+  function checkStage() {
+    if (stageIdx >= STAGES.length - 1) return;
+    if (score >= STAGES[stageIdx + 1].at) { stageIdx++; stageFlash = 150; sfxStageUp(); }
+  }
+
+  // ============================================================
+  // Dynamic-y helpers
+  // ============================================================
+  function batY(o)    { return o.baseY + Math.sin(o.phase) * o.amplitude; }
+  function jumperY(o) { return GROUND - o.h - Math.max(0, Math.sin(o.phase)) * o.jumpH; }
+
+  // ============================================================
+  // Ground check (pit avoidance)
+  // ============================================================
+  function groundSolidAt(x) {
+    const cx = x + PW * 0.5;
+    for (const o of obstacles) {
+      if (o.type === 'pit' && cx > o.x + 5 && cx < o.x + o.w - 5) return false;
+    }
+    return true;
+  }
+
+  // ============================================================
+  // Obstacles
+  // ============================================================
+  // Types: spike | slime | boulder | bat | jumper | ghost | pit
+  let obstacles = [];
+  let nextSpawn = 60;
+  let lastObType = '';
+
+  function spawnOb() {
+    let r = Math.random();
+    if (lastObType === 'pit') r = r * 0.75; // suppress back-to-back pits
+
+    let type;
+    // Weights: spike 20%, slime 16%, boulder 12%, bat 13%, jumper 11%, ghost 10%, pit 18%
+    if      (r < 0.20) type = 'spike';
+    else if (r < 0.36) type = 'slime';
+    else if (r < 0.48) type = 'boulder';
+    else if (r < 0.61) type = 'bat';
+    else if (r < 0.72) type = 'jumper';
+    else if (r < 0.82) type = 'ghost';
+    else               type = 'pit';
+    lastObType = type;
+
+    if (type === 'spike') {
+      const count = 1 + ~~(Math.random() * 3);
+      const w = count * 16 + 4, h = 26 + count * 3;
+      obstacles.push({ type, x: W+10, y: GROUND-h, w, h, count });
+
+    } else if (type === 'slime') {
+      obstacles.push({ type, x: W+10, y: GROUND-28, w: 28, h: 28, phase: Math.random()*Math.PI*2 });
+
+    } else if (type === 'boulder') {
+      const s = 32 + ~~(Math.random()*10);
+      obstacles.push({ type, x: W+10, y: GROUND-s, w: s, h: s });
+
+    } else if (type === 'bat') {
+      const baseY = 85 + ~~(Math.random() * 40);       // 85-125
+      const amplitude = 16 + stageIdx * 3;             // bigger swoop at high stage
+      obstacles.push({ type, x: W+10, baseY, w: 34, h: 20, amplitude, phase: Math.random()*Math.PI*2 });
+
+    } else if (type === 'jumper') {
+      const jumpH = 32 + stageIdx * 4;
+      obstacles.push({ type, x: W+10, y: GROUND-24, w: 22, h: 24, jumpH, phase: Math.random()*Math.PI*2 });
+
+    } else if (type === 'ghost') {
+      obstacles.push({ type, x: W+10, y: GHOST_TOP, w: 34+~~(Math.random()*12), h: GHOST_H, phase: Math.random()*Math.PI*2 });
+
+    } else { // pit
+      const pitW = 76 + Math.random() * 50 + stageIdx * 4;  // wider at high stage
+      obstacles.push({ type, x: W+10, y: GROUND, w: pitW, h: H-GROUND });
+    }
+
+    // Frequency: tighter with stage
+    nextSpawn = Math.max(36, 64 - stageIdx * 5) + ~~(Math.random() * 36);
+  }
+
+  // ============================================================
+  // Items  (coin & heart)
+  // ============================================================
+  let items = [];
+  let nextItem = 200;
+  let scoreBonus = 0;
+
+  function spawnItem() {
+    const r = Math.random();
+    let type, y;
+    if (lives < 3 && r < 0.22) {
+      type = 'heart';
+      y = GROUND - 72;                           // medium height
+    } else {
+      type = 'coin';
+      const h = Math.random();
+      if      (h < 0.30) y = GROUND - PH - 18;  // low: collect while running
+      else if (h < 0.75) y = GROUND - 76;        // medium: light jump
+      else               y = GROUND - 138;        // high: near apex
+    }
+    items.push({ type, x: W+10, y, w: 14, h: 14, phase: Math.random()*Math.PI*2 });
+    nextItem = 150 + ~~(Math.random() * 130);
+  }
+
+  // ============================================================
+  // Score popups
+  // ============================================================
+  let popups = [];
+
+  function addPopup(x, y, text, color) {
+    popups.push({ x, y, text, color, alpha: 1.0 });
+  }
+
+  // ============================================================
+  // Game state
+  // ============================================================
+  let gameState = 'start';
+  let tick = 0, score = 0, hiScore = 0, lives = 3;
+  function displayScore() { return Math.floor(score / 10) + scoreBonus; }
+
+  function resetGame() {
+    tick = 0; score = 0; scoreBonus = 0;
+    obstacles = []; items = []; popups = [];
+    nextSpawn = 60; nextItem = 200; lastObType = '';
+    stageIdx = 0; stageFlash = 0; lives = 3;
+    resetPlayer(); stopBGM();
+  }
+
+  // ============================================================
+  // Update
+  // ============================================================
+  function update() {
+    if (gameState !== 'playing') return;
+    tick++; score++;
+    checkStage();
+    const spd = currentSpeed();
+
+    // Stars
+    for (const s of stars) {
+      s.x -= s.spd * spd * 0.1;
+      if (s.x < 0) { s.x = W; s.y = Math.random() * (GROUND - 20); }
+    }
+
+    // Player physics
+    const wasOnGround = pl.onGround;
+    pl.vy += 0.75; pl.y += pl.vy;
+    if (pl.y >= GROUND - PH && groundSolidAt(pl.x)) {
+      pl.y = GROUND - PH; pl.vy = 0; pl.onGround = true;
+    }
+    if (!wasOnGround && pl.onGround) pl.rotation = 0;
+    if (!pl.onGround) pl.rotation += 0.14;
+    if (pl.onGround)  pl.legPhase += 0.22;
+    if (pl.invincible > 0) pl.invincible--;
+
+    // Pit fall
+    if (pl.y > H + 40) {
+      sfxFall(); lives--;
+      if (lives <= 0) {
+        gameState = 'gameover';
+        if (displayScore() > hiScore) hiScore = displayScore();
+        stopBGM();
+      } else {
+        resetPlayer(); pl.invincible = 120;
+        obstacles = obstacles.filter(o => !(o.type === 'pit' && o.x < pl.x + 200));
+      }
+      return;
+    }
+
+    // Obstacles
+    nextSpawn--;
+    if (nextSpawn <= 0) spawnOb();
+    for (const o of obstacles) {
+      o.x -= spd;
+      if (o.type === 'slime' || o.type === 'bat' || o.type === 'jumper' || o.type === 'ghost')
+        o.phase += 0.09;
+    }
+    obstacles = obstacles.filter(o => o.x + o.w > 0);
+
+    // Items
+    nextItem--;
+    if (nextItem <= 0) spawnItem();
+    for (const it of items) { it.x -= spd; it.phase += 0.08; }
+
+    // Collect items
+    for (const it of items) {
+      if (it.collected) continue;
+      if (pl.x + PW > it.x && pl.x < it.x + it.w &&
+          pl.y + PH > it.y && pl.y < it.y + it.h) {
+        it.collected = true;
+        if (it.type === 'coin') {
+          scoreBonus += 10; sfxCoin();
+          addPopup(it.x + 7, it.y - 4, '+10', C.coin);
+        } else {
+          if (lives < 3) {
+            lives++; sfxHeart();
+            addPopup(it.x + 7, it.y - 4, '+LIFE', C.heart);
+          } else {
+            scoreBonus += 10; sfxCoin();
+            addPopup(it.x + 7, it.y - 4, '+10', C.coin);
+          }
+        }
+      }
+    }
+    items = items.filter(it => !it.collected && it.x + it.w > 0);
+
+    // Popups
+    for (const p of popups) { p.y -= 1.3; p.alpha -= 0.018; }
+    popups = popups.filter(p => p.alpha > 0);
+
+    if (stageFlash > 0) stageFlash--;
+
+    // Collision
+    if (pl.invincible > 0) return;
+    const M = 4;
+    for (const o of obstacles) {
+      if (o.type === 'pit') continue;
+      let oy = o.y, oh = o.h;
+      if (o.type === 'bat')    { oy = batY(o); }
+      if (o.type === 'jumper') { oy = jumperY(o); }
+      if (pl.x+M < o.x+o.w && pl.x+PW-M > o.x &&
+          pl.y+M < oy+oh   && pl.y+PH-M > oy) {
+        sfxHit(); lives--;
+        if (lives <= 0) {
+          gameState = 'gameover';
+          if (displayScore() > hiScore) hiScore = displayScore();
+          stopBGM();
+        } else {
+          pl.invincible = 90;
+          obstacles = obstacles.filter(ob => ob !== o);
+        }
+        return;
+      }
+    }
+  }
+
+  // ============================================================
+  // Draw helpers
+  // ============================================================
+  function px(x, y, w, h, fill) { ctx.fillStyle = fill; ctx.fillRect(~~x, ~~y, ~~w, ~~h); }
+
+  // ---- Spike ----
+  function drawSpike(o) {
+    const { x, y, w, h, count } = o;
+    const sw = w / count, sh = h - 5;
+    for (let i = 0; i < count; i++) {
+      const sx = x + i * sw;
+      for (let row = 0; row < sh; row++) {
+        const p = row / (sh - 1);
+        const hw = Math.max(1, ~~(p * sw * 0.5));
+        const rx = sx + sw * 0.5 - hw;
+        ctx.fillStyle = row < 2 ? C.spikeTip : (p > 0.72 ? C.spikeD : C.spike);
+        ctx.fillRect(~~rx, ~~(y + row), hw * 2, 1);
+      }
+    }
+    px(x, y + h - 5, w, 3, C.spike);
+    px(x, y + h - 2, w, 2, C.spikeD);
+  }
+
+  // ---- Slime ----
+  function drawSlime(o) {
+    const { x, y, w, h, phase } = o;
+    const bob = ~~(Math.sin(phase) * 2);
+    const by = y + bob;
+    px(x+4, by,      w-8, 3,     C.slime);
+    px(x+2, by+3,    w-4, h-10,  C.slime);
+    px(x,   by+6,    w,   h-16,  C.slime);
+    px(x+2, by+h-9,  w-4, 4,     C.slimeD);
+    const blink = (~~(phase / Math.PI * 2) % 7 === 0);
+    if (blink) {
+      px(x+3,     by+5, 7, 2, C.slimeEye);
+      px(x+w-10,  by+5, 7, 2, C.slimeEye);
+    } else {
+      px(x+3,     by+4, 7, 7, 'white');
+      px(x+w-10,  by+4, 7, 7, 'white');
+      px(x+5,     by+5, 4, 4, C.slimeEye);
+      px(x+w-8,   by+5, 4, 4, C.slimeEye);
+      px(x+5,     by+5, 2, 2, 'white');
+      px(x+w-8,   by+5, 2, 2, 'white');
+    }
+    const la = ~~(Math.sin(phase * 1.5) * 3);
+    px(x+4,      by+h-5, 6, 5+la, C.slimeD);
+    px(x+w-10,   by+h-5, 6, 5-la, C.slimeD);
+  }
+
+  // ---- Boulder ----
+  function drawBoulder(o) {
+    const { x, y, w, h } = o;
+    px(x+5,   y,     w-10, h,     C.boulder);
+    px(x+3,   y+3,   w-6,  h-3,   C.boulder);
+    px(x,     y+6,   w,    h-10,  C.boulder);
+    px(x+2,   y+3,   w-4,  h-5,   C.boulder);
+    px(x+3,   y+h-6, w-6,  6,     C.boulderD);
+    px(x+5,   y+h-3, w-10, 3,     C.boulderD);
+    px(x+6,   y+4,   ~~(w*0.32), 3, C.boulderH);  // highlight
+    ctx.fillStyle = C.boulderC;
+    ctx.fillRect(~~(x+w*0.32), ~~(y+h*0.22), 2, ~~(h*0.32));
+    ctx.fillRect(~~(x+w*0.58), ~~(y+h*0.42), 2, ~~(h*0.24));
+  }
+
+  // ---- Bat ----
+  function drawBat(o) {
+    const oy  = ~~batY(o);
+    const { x, w, phase } = o;
+    const wf  = ~~(Math.sin(phase * 2.5) * 5);   // wing flap
+    const bx  = ~~(x + w/2 - 6);                  // body left
+    const bby = oy + 6;                            // body top
+
+    // Wings
+    px(x,          oy + 2 + wf, ~~(w*0.38), 3, C.bat);
+    px(x+2,        oy + 5 + wf, ~~(w*0.32), 3, C.bat);
+    px(~~(x+w*0.62), oy + 2 + wf, ~~(w*0.38), 3, C.bat);
+    px(~~(x+w*0.54), oy + 5 + wf, ~~(w*0.32), 3, C.bat);
+    // Wing membrane
+    px(bx-4, bby-1, 5, 6, C.batD);
+    px(bx+bx-x+7, bby-1, 5, 6, C.batD); // mirrored (approximation)
+
+    // Body
+    px(bx,   bby,   12, 10, C.bat);
+    px(bx+2, bby-2, 8,  3,  C.bat);  // head top
+    // Ears
+    px(bx+1, bby-5, 3, 5, C.batD);
+    px(bx+8, bby-5, 3, 5, C.batD);
+    px(bx+2, bby-4, 1, 3, C.bat);
+    px(bx+9, bby-4, 1, 3, C.bat);
+    // Eyes
+    px(bx+2, bby+2, 3, 3, C.batEye);
+    px(bx+7, bby+2, 3, 3, C.batEye);
+    px(bx+2, bby+2, 1, 1, 'white');
+    px(bx+7, bby+2, 1, 1, 'white');
+  }
+
+  // ---- Jumper ----
+  function drawJumper(o) {
+    const jy = ~~jumperY(o);
+    const { x, w, h, phase } = o;
+    const bounce = (GROUND - h) - jy;
+
+    // Spring trail when airborne
+    if (bounce > 4) {
+      ctx.strokeStyle = C.jumperD;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(~~(x + w/2), jy + h);
+      ctx.lineTo(~~(x + w/2), GROUND);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // Body
+    px(x+3, jy,      w-6, 3,     C.jumper);
+    px(x+1, jy+3,    w-2, h-6,   C.jumper);
+    px(x,   jy+5,    w,   h-10,  C.jumper);
+    px(x+2, jy+h-5,  w-4, 3,     C.jumperD);
+    // Eyes (look up when bouncing)
+    const ey = bounce > 5 ? jy+3 : jy+4;
+    px(x+2,     ey, 6, 6, 'white');
+    px(x+w-8,   ey, 6, 6, 'white');
+    px(x+3,     ey+1, 4, 4, C.jumperEye);
+    px(x+w-7,   ey+1, 4, 4, C.jumperEye);
+    px(x+3,     ey+1, 2, 2, 'white');
+    px(x+w-7,   ey+1, 2, 2, 'white');
+  }
+
+  // ---- Ghost (aerial) ----
+  function drawGhost(o) {
+    const { x, y, w, h, phase } = o;
+    const bob = ~~(Math.sin(phase) * 3);
+    const oy  = y + bob;
+    px(x+6,  oy,     w-12, 4,     C.ghost);
+    px(x+3,  oy+4,   w-6,  h-14,  C.ghost);
+    px(x,    oy+8,   w,    h-20,  C.ghost);
+    px(x+3,  oy+h-10, w-6, 4,     C.ghostD);
+    // Wavy hem
+    const wv = ~~(Math.sin(phase * 0.8) * 2);
+    for (let i = 0; i < 3; i++) {
+      const wx = x + i * ~~(w/3);
+      px(wx, oy+h-6 + (i%2===0 ? 0 : 4) + wv, ~~(w/3), 4, C.ghost);
+    }
+    // Eyes
+    px(x+5,    oy+9,  5, 5, C.ghostEye);
+    px(x+w-10, oy+9,  5, 5, C.ghostEye);
+    px(x+6,    oy+10, 2, 2, 'white');
+    px(x+w-9,  oy+10, 2, 2, 'white');
+    // Chain
+    ctx.fillStyle = C.ghostD;
+    for (let cy = oy-6; cy > 0; cy -= 10) ctx.fillRect(~~(x+w/2-2), cy, 4, 4);
+  }
+
+  function drawObstacles() {
+    for (const o of obstacles) {
+      if      (o.type === 'spike')   drawSpike(o);
+      else if (o.type === 'slime')   drawSlime(o);
+      else if (o.type === 'boulder') drawBoulder(o);
+      else if (o.type === 'bat')     drawBat(o);
+      else if (o.type === 'jumper')  drawJumper(o);
+      else if (o.type === 'ghost')   drawGhost(o);
+      // pit drawn in drawGround
+    }
+  }
+
+  // ---- Coin ----
+  function drawCoin(it) {
+    const { x, y, phase } = it;
+    const sw = Math.max(2, ~~(14 * Math.abs(Math.cos(phase)))); // spin effect
+    const ox = ~~((14 - sw) / 2);
+    px(x+ox+2, y,     sw-4, 14, C.coin);
+    px(x+ox+1, y+2,   sw-2, 10, C.coin);
+    px(x+ox,   y+4,   sw,   6,  C.coin);
+    if (sw > 6) px(x+ox+2, y+3, ~~(sw*0.35), 3, C.coinShine);
+    // Sparkle when near
+    if (~~(phase * 2) % 8 < 2) {
+      ctx.fillStyle = C.coinShine;
+      ctx.fillRect(~~(x+14), ~~(y-3), 3, 3);
+      ctx.fillRect(~~(x-2),  ~~(y+2), 3, 3);
+    }
+  }
+
+  // ---- Heart item ----
+  function drawHeartItem(it) {
+    const { x, y, phase } = it;
+    const bob = ~~(Math.sin(phase) * 2);
+    const hy  = y + bob;
+    // Pixel heart shape
+    px(x+1,  hy+2,  4, 4, C.heart);
+    px(x+9,  hy+2,  4, 4, C.heart);
+    px(x,    hy+4,  14, 4, C.heart);
+    px(x+2,  hy+8,  10, 3, C.heart);
+    px(x+4,  hy+11, 6,  2, C.heart);
+    px(x+6,  hy+13, 2,  1, C.heart);
+    px(x+2,  hy+3,  3,  2, C.heartShine);
+  }
+
+  function drawItems() {
+    for (const it of items) {
+      if (it.collected) continue;
+      if (it.type === 'coin')  drawCoin(it);
+      else                     drawHeartItem(it);
+    }
+  }
+
+  function drawPopups() {
+    ctx.font = 'bold 13px "Courier New"';
+    ctx.textAlign = 'center';
+    for (const p of popups) {
+      ctx.globalAlpha = p.alpha;
+      ctx.fillStyle = p.color;
+      ctx.fillText(p.text, ~~p.x, ~~p.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'left';
+  }
+
+  // ---- Player ----
+  function drawPlayer() {
+    if (pl.invincible > 0 && (~~(pl.invincible / 5)) % 2 === 0) return;
+    ctx.save();
+    ctx.translate(~~(pl.x + PW/2), ~~(pl.y + PH/2));
+    ctx.rotate(pl.rotation);
+    ctx.translate(-PW/2, -PH/2);
+    px(3, 0,  PW-6, PH-4, C.player);
+    px(1, 3,  PW-2, PH-8, C.player);
+    px(0, 7,  PW,   PH-14, C.player);
+    px(1, PH-6, PW-2, 4, C.playerD);
+    px(PW-11, 4,  9, 9, 'white');
+    px(PW-10, 5,  7, 7, C.eye);
+    px(PW-9,  5,  3, 3, 'white');
+    px(PW-7,  8,  2, 2, 'white');
+    px(PW-14, 11, 4, 3, C.blush);
+    px(PW-10, 15, 2, 2, C.eye);
+    px(PW-8,  16, 3, 1, C.eye);
+    px(PW-5,  15, 2, 2, C.eye);
+    if (pl.onGround) {
+      const a = ~~(Math.sin(pl.legPhase) * 3);
+      px(3,      PH-3, 5, 4+a, C.playerD);
+      px(PW-8,   PH-3, 5, 4-a, C.playerD);
+    }
+    ctx.restore();
+  }
+
+  // ---- Ground with pits ----
+  function drawGround() {
+    px(0, GROUND, W, 3, C.ground);
+    ctx.fillStyle = 'rgba(180,180,200,0.3)';
+    const dw = 26, gap = 16;
+    const off = -(tick * currentSpeed() * 0.4) % (dw + gap);
+    for (let dx = off; dx < W; dx += dw + gap) ctx.fillRect(~~dx, GROUND+9, dw, 2);
+    for (const o of obstacles) {
+      if (o.type !== 'pit') continue;
+      px(o.x, GROUND-1, o.w, H-GROUND+1, C.pit);
+      ctx.fillStyle = 'rgba(0,0,30,0.5)';
+      ctx.fillRect(~~o.x+4, GROUND+8, ~~o.w-8, 6);
+      ctx.fillRect(~~o.x+8, GROUND+20, ~~o.w-16, 4);
+      px(o.x-5,        GROUND-5, 9, 8, C.dirt);
+      px(o.x-4,        GROUND-3, 6, 3, C.dirtD);
+      px(o.x+o.w-4,    GROUND-5, 9, 8, C.dirt);
+      px(o.x+o.w-2,    GROUND-3, 6, 3, C.dirtD);
+    }
+  }
+
+  function drawStars() {
+    ctx.fillStyle = C.star;
+    for (const s of stars) ctx.fillRect(~~s.x, ~~s.y, 2, 2);
+  }
+
+  function drawHUD() {
+    ctx.font = 'bold 16px "Courier New"';
+    ctx.textAlign = 'left'; ctx.fillStyle = C.hud;
+    ctx.fillText(`SCORE  ${String(displayScore()).padStart(6,'0')}`, 14, 28);
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = C.orange; ctx.font = 'bold 14px "Courier New"';
+    ctx.fillText(`STAGE  ${stageIdx+1}`, W/2, 26);
+
+    for (let i = 0; i < 3; i++) {
+      ctx.fillStyle = i < lives ? C.life : '#333';
+      ctx.font = '16px serif'; ctx.textAlign = 'right';
+      ctx.fillText('♥', W-14 - i*22, 26);
+    }
+    if (stageFlash > 0) {
+      ctx.globalAlpha = Math.min(1, stageFlash / 40);
+      ctx.fillStyle = C.orange; ctx.font = 'bold 28px "Courier New"';
+      ctx.textAlign = 'center';
+      ctx.fillText(`STAGE  ${stageIdx+1}`, W/2, H/2-6);
+      ctx.globalAlpha = 1;
+    }
+    ctx.textAlign = 'left';
+  }
+
+  function drawOverlay(title, line1, line2, tc) {
+    ctx.fillStyle = C.dim; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = tc;    ctx.font = 'bold 36px "Courier New"'; ctx.fillText(title, W/2, H/2-18);
+    ctx.fillStyle = C.hud; ctx.font = '16px "Courier New"';      ctx.fillText(line1, W/2, H/2+14);
+    if (line2) { ctx.fillStyle = C.muted; ctx.font = '12px "Courier New"'; ctx.fillText(line2, W/2, H/2+38); }
+    ctx.textAlign = 'left';
+  }
+
+  // ============================================================
+  // Main loop
+  // ============================================================
+  function draw() {
+    px(0, 0, W, H, C.bg);
+    drawStars(); drawGround(); drawItems(); drawObstacles(); drawPlayer(); drawPopups(); drawHUD();
+    if (gameState === 'start')    drawOverlay('MINI RUNNER', 'SPACE キーでスタート', null, C.accent);
+    if (gameState === 'gameover') drawOverlay('GAME OVER',   `スコア  ${displayScore()}`, `BEST  ${hiScore}    SPACE でリスタート`, C.orange);
+  }
+  function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+  // ============================================================
+  // Input
+  // ============================================================
+  document.addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault();
+    if      (gameState === 'start')    { gameState = 'playing'; initAudio(); startBGM(); }
+    else if (gameState === 'playing')  doJump();
+    else if (gameState === 'gameover') { resetGame(); gameState = 'playing'; startBGM(); }
+  });
+  canvas.addEventListener('pointerdown', () => {
+    if      (gameState === 'start')    { gameState = 'playing'; initAudio(); startBGM(); }
+    else if (gameState === 'playing')  doJump();
+    else if (gameState === 'gameover') { resetGame(); gameState = 'playing'; startBGM(); }
+  });
+
+  resetGame();
+  loop();
+})();
+</script>
+</body>
+</html>
