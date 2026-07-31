@@ -117,15 +117,15 @@
   #choices {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 10px;
+    gap: 8px;
     margin-bottom: 10px;
   }
   .choiceBtn {
     background: #eef4ff;
     border: 2px solid #d6e4fa;
-    border-radius: 14px;
-    padding: 14px 8px;
-    font-size: 16px;
+    border-radius: 12px;
+    padding: 10px 6px;
+    font-size: 14px;
     font-weight: bold;
     color: #2c4667;
     cursor: pointer;
@@ -204,7 +204,7 @@
 
   @media (max-width: 420px) {
     #flagEmoji { font-size: 84px; }
-    .choiceBtn { font-size: 14px; padding: 12px 6px; }
+    .choiceBtn { font-size: 12px; padding: 9px 4px; }
   }
 </style>
 </head>
@@ -381,7 +381,7 @@
     current = quizList[qIndex];
 
     // build 4 choices
-    const wrongPool = shuffle(COUNTRIES.filter(c => c.name !== current.name)).slice(0, 3);
+    const wrongPool = shuffle(COUNTRIES.filter(c => c.name !== current.name)).slice(0, 9);
     currentChoices = shuffle([current, ...wrongPool]);
 
     flagEmoji.textContent = current.flag;
@@ -504,8 +504,8 @@
       if (e.code === 'Enter' || e.code === 'Space') startGame();
       return;
     }
-    if (!answered && ['1', '2', '3', '4'].includes(e.key)) {
-      const idx = Number(e.key) - 1;
+    if (!answered && ['1','2','3','4','5','6','7','8','9','0'].includes(e.key)) {
+      const idx = e.key === '0' ? 9 : Number(e.key) - 1;
       const btns = choicesBox.querySelectorAll('.choiceBtn');
       if (btns[idx]) selectAnswer(currentChoices[idx], btns[idx]);
     } else if (answered && (e.code === 'Enter' || e.code === 'Space')) {
